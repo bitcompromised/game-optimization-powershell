@@ -18,6 +18,7 @@ typedef struct {
     int (*revert)(void);
     int (*is_active)(void);   /* live query of actual system state: 1 active, 0 inactive */
     int enabled;               /* in-memory cache of is_active(), refreshed via tweaks_refresh_state() */
+    int requires_reboot;       /* the change is written immediately but only takes effect after a restart */
 } Tweak;
 
 extern Tweak g_tweaks[];
@@ -27,9 +28,9 @@ extern const int g_tweak_count;
  * the UI needs to reflect current reality (tab opened, after any apply/revert/disable-all). */
 void tweaks_refresh_state(void);
 
-/* Flips the tweak at `index`: if currently off, calls apply(); if on, calls revert().
- * On success, updates in-memory state and persists to config.ini. Returns 0 on success,
- * -1 if the underlying apply/revert failed (state is left unchanged). */
+/* Flips the tweak at `index`: if currently off, calls apply(); if on, calls revert(), then
+ * re-reads the live state. Nothing is persisted. Returns 0 if the tweak ended up in the
+ * requested state, -1 otherwise. */
 int tweaks_toggle(int index);
 
 #endif
