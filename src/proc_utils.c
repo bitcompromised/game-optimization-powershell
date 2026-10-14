@@ -162,6 +162,7 @@ int proc_list(ProcInfo *out, DWORD sample_ms) {
     for (int i = 0; i < count; i++) {
         double cpu_pct = 0.0;
         SIZE_T ws_kb = 0;
+        int affinity_cores = 0;
 
         if (handles[i]) {
             if (has_times[i] && get_process_time_100ns(handles[i], &t1[i]) == 0 && elapsed_100ns > 0) {
@@ -175,17 +176,124 @@ int proc_list(ProcInfo *out, DWORD sample_ms) {
             if (GetProcessMemoryInfo(handles[i], &pmc, sizeof(pmc))) {
                 ws_kb = pmc.WorkingSetSize / 1024;
             }
+
+            DWORD_PTR proc_mask = 0, sys_mask = 0;
+            if (GetProcessAffinityMask(handles[i], &proc_mask, &sys_mask)) {
+                out[i].affinity_mask = proc_mask;
+                while (proc_mask) {
+                    affinity_cores += (int)(proc_mask & 1);
+                    proc_mask >>= 1;
+                }
+            } else {
+                out[i].affinity_mask = 0;
+            }
             CloseHandle(handles[i]);
+        } else {
+            out[i].affinity_mask = 0;
         }
 
         out[i].pid = pids[i];
-        strncpy(out[i].name, names[i], PROC_NAME_MAX - 1);
+        memcpy(out[i].name, names[i], PROC_NAME_MAX);
         out[i].name[PROC_NAME_MAX - 1] = '\0';
         out[i].working_set_kb = ws_kb;
         out[i].cpu_percent = cpu_pct;
+        out[i].affinity_cores = affinity_cores;
         out[i].flagged = proc_is_bloat(names[i]);
     }
 
     qsort(out, count, sizeof(ProcInfo), cmp_proc_cpu_desc);
     return count;
+}
+
+/* --- Non-blocking sampler ---------------------------------------------------------------
+ * A process is identified across calls by PID *and* creation time, so a PID that Windows
+ * recycled for a new process never inherits the old one's CPU total. */
+
+typedef struct {
+    DWORD pid;
+    ULONGLONG created;
+    ULONGLONG cpu_100ns;
+} ProcSample;
+
+int proc_list_delta(ProcInfo *out) {
+    static ProcSample prev[PROC_MAX], cur[PROC_MAX];
+    static int prev_count;
+    static LARGE_INTEGER prev_qpc;
+    static DWORD pids[PROC_MAX];
+    static char names[PROC_MAX][PROC_NAME_MAX];
+
+    int count = snapshot_pids(pids, names, PROC_MAX);
+
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    double num_cpus = si.dwNumberOfProcessors ? (double)si.dwNumberOfProcessors : 1.0;
+
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    double elapsed_100ns = prev_count > 0
+        ? (double)(now.QuadPart - prev_qpc.QuadPart) / (double)freq.QuadPart * 10000000.0
+        : 0.0;
+
+    for (int i = 0; i < count; i++) {
+        ProcInfo *p = &out[i];
+        memset(p, 0, sizeof(*p));
+        p->pid = pids[i];
+        memcpy(p->name, names[i], PROC_NAME_MAX);
+        p->name[PROC_NAME_MAX - 1] = '\0';
+        p->flagged = proc_is_bloat(p->name);
+        cur[i].pid = pids[i];
+        cur[i].created = 0;
+        cur[i].cpu_100ns = 0;
+
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pids[i]);
+        if (!h) continue;
+
+        FILETIME creation, exit_t, kernel, user;
+        if (GetProcessTimes(h, &creation, &exit_t, &kernel, &user)) {
+            ULARGE_INTEGER c, k, u;
+            c.LowPart = creation.dwLowDateTime; c.HighPart = creation.dwHighDateTime;
+            k.LowPart = kernel.dwLowDateTime;   k.HighPart = kernel.dwHighDateTime;
+            u.LowPart = user.dwLowDateTime;     u.HighPart = user.dwHighDateTime;
+            cur[i].created = c.QuadPart;
+            cur[i].cpu_100ns = k.QuadPart + u.QuadPart;
+
+            if (elapsed_100ns > 0) {
+                for (int j = 0; j < prev_count; j++) {
+                    if (prev[j].pid != pids[i] || prev[j].created != c.QuadPart) continue;
+                    if (cur[i].cpu_100ns >= prev[j].cpu_100ns) {
+                        double pct = (double)(cur[i].cpu_100ns - prev[j].cpu_100ns) /
+                                     (elapsed_100ns * num_cpus) * 100.0;
+                        p->cpu_percent = pct > 100.0 ? 100.0 : pct;
+                    }
+                    break;
+                }
+            }
+        }
+
+        PROCESS_MEMORY_COUNTERS pmc;
+        if (GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) p->working_set_kb = pmc.WorkingSetSize / 1024;
+
+        DWORD_PTR proc_mask = 0, sys_mask = 0;
+        if (GetProcessAffinityMask(h, &proc_mask, &sys_mask)) {
+            p->affinity_mask = proc_mask;
+            for (DWORD_PTR m = proc_mask; m; m >>= 1) p->affinity_cores += (int)(m & 1);
+        }
+        CloseHandle(h);
+    }
+
+    memcpy(prev, cur, sizeof(ProcSample) * (size_t)count);
+    prev_count = count;
+    prev_qpc = now;
+    return count;
+}
+
+int proc_image_path(DWORD pid, char *out, size_t out_size) {
+    out[0] = '\0';
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return -1;
+    DWORD size = (DWORD)out_size;
+    BOOL ok = QueryFullProcessImageNameA(h, 0, out, &size);
+    CloseHandle(h);
+    return ok ? 0 : -1;
 }

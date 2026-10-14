@@ -11,6 +11,10 @@ static void profile_get_dir(char *out, size_t out_size) {
     CreateDirectoryA(out, NULL);
 }
 
+void profile_dir(char *out, size_t out_size) {
+    profile_get_dir(out, out_size);
+}
+
 int profile_name_is_valid(const char *name) {
     size_t len = strlen(name);
     if (len == 0 || len >= PROFILE_NAME_MAX) return 0;
@@ -114,19 +118,25 @@ int profile_delete(const char *name) {
     return (DeleteFileA(path) || GetLastError() == ERROR_FILE_NOT_FOUND) ? 0 : -1;
 }
 
-int profile_compute_diff(const char *name, ProfileDiff *diff) {
+int profile_exists(const char *name) {
+    if (!profile_name_is_valid(name)) return 0;
+    char path[MAX_PATH];
+    profile_get_path(name, path, sizeof(path));
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+int profile_read(const char *name, ProfileContents *out) {
+    memset(out, 0, sizeof(*out));
     if (!profile_name_is_valid(name)) return -1;
 
     char path[MAX_PATH];
     profile_get_path(name, path, sizeof(path));
 
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &attr)) out->saved = attr.ftLastWriteTime;
+
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-
-    static char saved_procs[PROC_MAX][PROC_NAME_MAX];
-    int saved_proc_count = 0;
-    static char saved_services[PROFILE_MAX_SERVICES][64];
-    int saved_service_count = 0;
 
     char line[300];
     while (fgets(line, sizeof(line), f)) {
@@ -139,17 +149,23 @@ int profile_compute_diff(const char *name, ProfileDiff *diff) {
         const char *key = line;
         const char *val = eq + 1;
 
-        if (strcmp(key, "process") == 0 && saved_proc_count < PROC_MAX) {
-            strncpy(saved_procs[saved_proc_count], val, PROC_NAME_MAX - 1);
-            saved_procs[saved_proc_count][PROC_NAME_MAX - 1] = '\0';
-            saved_proc_count++;
-        } else if (strcmp(key, "service") == 0 && saved_service_count < PROFILE_MAX_SERVICES) {
-            strncpy(saved_services[saved_service_count], val, 63);
-            saved_services[saved_service_count][63] = '\0';
-            saved_service_count++;
+        if (strcmp(key, "process") == 0 && out->process_count < PROC_MAX) {
+            strncpy(out->processes[out->process_count], val, PROC_NAME_MAX - 1);
+            out->processes[out->process_count][PROC_NAME_MAX - 1] = '\0';
+            out->process_count++;
+        } else if (strcmp(key, "service") == 0 && out->service_count < PROFILE_MAX_SERVICES) {
+            strncpy(out->services[out->service_count], val, 63);
+            out->services[out->service_count][63] = '\0';
+            out->service_count++;
         }
     }
     fclose(f);
+    return 0;
+}
+
+int profile_compute_diff(const char *name, ProfileDiff *diff) {
+    static ProfileContents saved;
+    if (profile_read(name, &saved) != 0) return -1;
 
     memset(diff, 0, sizeof(*diff));
 
@@ -161,8 +177,8 @@ int profile_compute_diff(const char *name, ProfileDiff *diff) {
         if (procs[i].pid == self_pid) continue;
 
         int in_profile = 0;
-        for (int j = 0; j < saved_proc_count; j++) {
-            if (_stricmp(saved_procs[j], procs[i].name) == 0) { in_profile = 1; break; }
+        for (int j = 0; j < saved.process_count; j++) {
+            if (_stricmp(saved.processes[j], procs[i].name) == 0) { in_profile = 1; break; }
         }
         if (in_profile) continue;
 
@@ -182,8 +198,8 @@ int profile_compute_diff(const char *name, ProfileDiff *diff) {
         if (svc_query_state(KNOWN_SERVICES[i].service_name, &state) != 0 || state != SERVICE_RUNNING) continue;
 
         int in_profile = 0;
-        for (int j = 0; j < saved_service_count; j++) {
-            if (_stricmp(saved_services[j], KNOWN_SERVICES[i].service_name) == 0) { in_profile = 1; break; }
+        for (int j = 0; j < saved.service_count; j++) {
+            if (_stricmp(saved.services[j], KNOWN_SERVICES[i].service_name) == 0) { in_profile = 1; break; }
         }
         if (in_profile) continue;
 

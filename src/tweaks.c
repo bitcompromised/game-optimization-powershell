@@ -75,6 +75,46 @@ static int powercfg_set_setting(const char *subgroup, const char *setting, int v
     return ps_run(script);
 }
 
+/* Removes an explicit per-scheme override so the setting falls back to whatever default
+ * Windows ships for the active plan. Used to revert settings whose stock value differs
+ * between schemes and Windows builds, where writing a hardcoded "default" would be a guess. */
+static int powercfg_clear_setting(const char *subgroup, const char *setting) {
+    char key[512];
+    if (active_scheme_setting_key(subgroup, setting, key, sizeof(key)) != 0) return -1;
+    int rc = 0;
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, key, "ACSettingIndex");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, key, "DCSettingIndex");
+    rc |= ps_run("powercfg /setactive SCHEME_CURRENT\r\n");
+    return rc;
+}
+
+/* --- Boot Configuration Data, read once per refresh ---------------------------------------
+ * Every bcdedit query costs a PowerShell launch, which is slow enough to stall the UI if each
+ * boot-related tweak runs its own. One script collects them all into a bitmask instead, and
+ * tweaks_refresh_state() invalidates it at the start of each pass. */
+
+#define BCD_DYNAMIC_TICK_OFF  0x01
+#define BCD_PLATFORM_CLOCK_NO 0x02
+
+static int g_bcd_flags;
+static int g_bcd_flags_valid;
+
+static void bcd_flags_invalidate(void) { g_bcd_flags_valid = 0; }
+
+static int bcd_flags(void) {
+    if (!g_bcd_flags_valid) {
+        long v = 0;
+        const char *script =
+            "$__result = 0\r\n"
+            "$out = (& bcdedit /enum '{current}' 2>$null) -join \"`n\"\r\n"
+            "if ($out -match 'disabledynamictick\\s+Yes') { $__result = $__result -bor 1 }\r\n"
+            "if ($out -match 'useplatformclock\\s+No')    { $__result = $__result -bor 2 }\r\n";
+        g_bcd_flags = (ps_capture_int(script, &v) == 0) ? (int)v : 0;
+        g_bcd_flags_valid = 1;
+    }
+    return g_bcd_flags;
+}
+
 /* --- Per-NIC registry iteration (used for adapter power mgmt / interrupt moderation) --- */
 
 typedef struct {
@@ -260,19 +300,27 @@ static int active_hibernate_off(void) {
 }
 
 static int apply_dynamic_tick_off(void) {
+    bcd_flags_invalidate();
     return ps_run("bcdedit /set disabledynamictick yes\r\n");
 }
 static int revert_dynamic_tick_off(void) {
+    bcd_flags_invalidate();
     return ps_run("bcdedit /deletevalue disabledynamictick\r\n");
 }
 static int active_dynamic_tick_off(void) {
-    long v = 0;
-    const char *script =
-        "$__result = 0\r\n"
-        "$out = & bcdedit /enum '{current}' 2>$null\r\n"
-        "if ($out -match 'disabledynamictick\\s+Yes') { $__result = 1 }\r\n";
-    if (ps_capture_int(script, &v) != 0) return 0;
-    return v == 1;
+    return (bcd_flags() & BCD_DYNAMIC_TICK_OFF) != 0;
+}
+
+static int apply_platform_clock_off(void) {
+    bcd_flags_invalidate();
+    return ps_run("bcdedit /set useplatformclock no\r\n");
+}
+static int revert_platform_clock_off(void) {
+    bcd_flags_invalidate();
+    return ps_run("bcdedit /deletevalue useplatformclock\r\n");
+}
+static int active_platform_clock_off(void) {
+    return (bcd_flags() & BCD_PLATFORM_CLOCK_NO) != 0;
 }
 
 static int apply_nic_power_off(void) {
@@ -498,6 +546,209 @@ static int active_driver_search_off(void) {
     return reg_dword_equals(HKEY_LOCAL_MACHINE,
                             "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\DriverSearching",
                             "SearchOrderConfig", 0);
+}
+
+#define POWER_THROTTLING_KEY "SYSTEM\\CurrentControlSet\\Control\\Power\\PowerThrottling"
+
+static int apply_power_throttling_off(void) {
+    return reg_set_dword(HKEY_LOCAL_MACHINE, POWER_THROTTLING_KEY, "PowerThrottlingOff", 1);
+}
+static int revert_power_throttling_off(void) {
+    return reg_delete_value(HKEY_LOCAL_MACHINE, POWER_THROTTLING_KEY, "PowerThrottlingOff");
+}
+static int active_power_throttling_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, POWER_THROTTLING_KEY, "PowerThrottlingOff", 1);
+}
+
+#define SETTING_CPMINCORES "0cc5b647-c1df-4637-891a-dec35c318583"
+
+static int apply_core_parking_off(void) {
+    /* 100% of cores must stay unparked, so the scheduler never has to wake a parked core
+     * mid-frame -- that wake-up is where the stutter comes from. */
+    return powercfg_set_setting(SUBGROUP_PROCESSOR, SETTING_CPMINCORES, 100);
+}
+static int revert_core_parking_off(void) {
+    return powercfg_clear_setting(SUBGROUP_PROCESSOR, SETTING_CPMINCORES);
+}
+static int active_core_parking_off(void) {
+    return active_scheme_ac_index_is(SUBGROUP_PROCESSOR, SETTING_CPMINCORES, 100);
+}
+
+#define DWM_KEY "SOFTWARE\\Microsoft\\Windows\\Dwm"
+
+static int apply_mpo_off(void) {
+    return reg_set_dword(HKEY_LOCAL_MACHINE, DWM_KEY, "OverlayTestMode", 5);
+}
+static int revert_mpo_off(void) {
+    return reg_delete_value(HKEY_LOCAL_MACHINE, DWM_KEY, "OverlayTestMode");
+}
+static int active_mpo_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, DWM_KEY, "OverlayTestMode", 5);
+}
+
+#define MOUSE_KEY "Control Panel\\Mouse"
+
+static int apply_mouse_accel_off(void) {
+    int rc = 0;
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseSpeed", "0");
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseThreshold1", "0");
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseThreshold2", "0");
+    /* Push it into the live session too, so it applies without signing out. */
+    INT params[3] = { 0, 0, 0 };
+    SystemParametersInfoA(SPI_SETMOUSE, 0, params, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    return rc;
+}
+static int revert_mouse_accel_off(void) {
+    int rc = 0;
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseSpeed", "1");
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseThreshold1", "6");
+    rc |= reg_set_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseThreshold2", "10");
+    INT params[3] = { 6, 10, 1 };
+    SystemParametersInfoA(SPI_SETMOUSE, 0, params, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    return rc;
+}
+static int active_mouse_accel_off(void) {
+    char value[16];
+    if (reg_get_string(HKEY_CURRENT_USER, MOUSE_KEY, "MouseSpeed", value, sizeof(value)) != 0) return 0;
+    return strcmp(value, "0") == 0;
+}
+
+#define GAMECONFIG_KEY "System\\GameConfigStore"
+
+static int apply_fso_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_FSEBehaviorMode", 2);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_HonorUserFSEBehaviorMode", 1);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_DXGIHonorFSEWindowsCompatible", 1);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_EFSEFeatureFlags", 0);
+    return rc;
+}
+static int revert_fso_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_FSEBehaviorMode", 0);
+    rc |= reg_delete_value(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_HonorUserFSEBehaviorMode");
+    rc |= reg_delete_value(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_DXGIHonorFSEWindowsCompatible");
+    rc |= reg_delete_value(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_EFSEFeatureFlags");
+    return rc;
+}
+static int active_fso_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, GAMECONFIG_KEY, "GameDVR_FSEBehaviorMode", 2);
+}
+
+/* Accessibility "Flags" are REG_SZ bitmasks; clearing bit 2 (0x04) is what removes the
+ * keyboard shortcut, leaving the feature itself available from Settings. */
+#define ACCESS_STICKY   "Control Panel\\Accessibility\\StickyKeys"
+#define ACCESS_TOGGLE   "Control Panel\\Accessibility\\ToggleKeys"
+#define ACCESS_FILTER   "Control Panel\\Accessibility\\Keyboard Response"
+
+static int apply_accessibility_hotkeys_off(void) {
+    int rc = 0;
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_STICKY, "Flags", "506");
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_TOGGLE, "Flags", "58");
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_FILTER, "Flags", "122");
+    return rc;
+}
+static int revert_accessibility_hotkeys_off(void) {
+    int rc = 0;
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_STICKY, "Flags", "510");
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_TOGGLE, "Flags", "62");
+    rc |= reg_set_string(HKEY_CURRENT_USER, ACCESS_FILTER, "Flags", "126");
+    return rc;
+}
+static int active_accessibility_hotkeys_off(void) {
+    char value[16];
+    if (reg_get_string(HKEY_CURRENT_USER, ACCESS_STICKY, "Flags", value, sizeof(value)) != 0) return 0;
+    return strcmp(value, "506") == 0;
+}
+
+#define PUSH_NOTIFICATIONS_KEY "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\PushNotifications"
+
+static int apply_toasts_off(void) {
+    return reg_set_dword(HKEY_CURRENT_USER, PUSH_NOTIFICATIONS_KEY, "ToastEnabled", 0);
+}
+static int revert_toasts_off(void) {
+    return reg_delete_value(HKEY_CURRENT_USER, PUSH_NOTIFICATIONS_KEY, "ToastEnabled");
+}
+static int active_toasts_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, PUSH_NOTIFICATIONS_KEY, "ToastEnabled", 0);
+}
+
+#define WIDGETS_POLICY_KEY "SOFTWARE\\Policies\\Microsoft\\Dsh"
+
+static int apply_widgets_off(void) {
+    return reg_set_dword(HKEY_LOCAL_MACHINE, WIDGETS_POLICY_KEY, "AllowNewsAndInterests", 0);
+}
+static int revert_widgets_off(void) {
+    return reg_delete_value(HKEY_LOCAL_MACHINE, WIDGETS_POLICY_KEY, "AllowNewsAndInterests");
+}
+static int active_widgets_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, WIDGETS_POLICY_KEY, "AllowNewsAndInterests", 0);
+}
+
+#define MAINTENANCE_KEY "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\Maintenance"
+
+static int apply_auto_maintenance_off(void) {
+    return reg_set_dword(HKEY_LOCAL_MACHINE, MAINTENANCE_KEY, "MaintenanceDisabled", 1);
+}
+static int revert_auto_maintenance_off(void) {
+    return reg_delete_value(HKEY_LOCAL_MACHINE, MAINTENANCE_KEY, "MaintenanceDisabled");
+}
+static int active_auto_maintenance_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, MAINTENANCE_KEY, "MaintenanceDisabled", 1);
+}
+
+static int apply_pca_off(void) {
+    int rc = svc_set_start_type("PcaSvc", SERVICE_DISABLED);
+    svc_stop("PcaSvc");
+    return rc;
+}
+static int revert_pca_off(void) {
+    int rc = svc_set_start_type("PcaSvc", SERVICE_AUTO_START);
+    svc_start("PcaSvc");
+    return rc;
+}
+static int active_pca_off(void) { return svc_is_disabled("PcaSvc"); }
+
+#define EDGE_POLICY_KEY "SOFTWARE\\Policies\\Microsoft\\Edge"
+
+static int apply_edge_background_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "BackgroundModeEnabled", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "StartupBoostEnabled", 0);
+    return rc;
+}
+static int revert_edge_background_off(void) {
+    int rc = 0;
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "BackgroundModeEnabled");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "StartupBoostEnabled");
+    return rc;
+}
+static int active_edge_background_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "StartupBoostEnabled", 0);
+}
+
+/* Image File Execution Options -> PerfOptions is the documented way to ask Windows to create
+ * a given executable at a non-default priority. It is applied by the loader at launch, so the
+ * game never has to be opened for write from outside -- which is exactly what a kernel
+ * anti-cheat refuses. Note this is PerfOptions, not the "Debugger" value: nothing is
+ * injected, substituted or attached. */
+#define IFEO_KEY "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
+#define VALORANT_PERF_KEY IFEO_KEY "\\VALORANT-Win64-Shipping.exe\\PerfOptions"
+
+static int apply_valorant_priority(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, VALORANT_PERF_KEY, "CpuPriorityClass", 3); /* High */
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, VALORANT_PERF_KEY, "IoPriority", 3);       /* High */
+    return rc;
+}
+static int revert_valorant_priority(void) {
+    int rc = 0;
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, VALORANT_PERF_KEY, "CpuPriorityClass");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, VALORANT_PERF_KEY, "IoPriority");
+    return rc;
+}
+static int active_valorant_priority(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, VALORANT_PERF_KEY, "CpuPriorityClass", 3);
 }
 
 /* =======================================================================
@@ -995,6 +1246,114 @@ static int revert_dmwappush_off(void) {
 }
 static int active_dmwappush_off(void) { return svc_is_disabled("dmwappushservice"); }
 
+#define SEARCH_SETTINGS_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\SearchSettings"
+
+static int apply_cloud_search_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsMSACloudSearchEnabled", 0);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsAADCloudSearchEnabled", 0);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsDeviceSearchHistoryEnabled", 0);
+    return rc;
+}
+static int revert_cloud_search_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsMSACloudSearchEnabled", 1);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsAADCloudSearchEnabled", 1);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsDeviceSearchHistoryEnabled", 1);
+    return rc;
+}
+static int active_cloud_search_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, SEARCH_SETTINGS_KEY, "IsDeviceSearchHistoryEnabled", 0);
+}
+
+#define EXPLORER_ADVANCED_KEY "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"
+
+static int apply_app_launch_tracking_off(void) {
+    return reg_set_dword(HKEY_CURRENT_USER, EXPLORER_ADVANCED_KEY, "Start_TrackProgs", 0);
+}
+static int revert_app_launch_tracking_off(void) {
+    return reg_set_dword(HKEY_CURRENT_USER, EXPLORER_ADVANCED_KEY, "Start_TrackProgs", 1);
+}
+static int active_app_launch_tracking_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, EXPLORER_ADVANCED_KEY, "Start_TrackProgs", 0);
+}
+
+#define VOICE_ACTIVATION_KEY \
+    "Software\\Microsoft\\Speech_OneCore\\Settings\\VoiceActivation\\UserPreferenceForAllApps"
+
+static int apply_voice_activation_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_CURRENT_USER, VOICE_ACTIVATION_KEY, "AgentActivationEnabled", 0);
+    rc |= reg_set_dword(HKEY_CURRENT_USER, VOICE_ACTIVATION_KEY,
+                        "AgentActivationOnLockScreenEnabled", 0);
+    return rc;
+}
+static int revert_voice_activation_off(void) {
+    int rc = 0;
+    rc |= reg_delete_value(HKEY_CURRENT_USER, VOICE_ACTIVATION_KEY, "AgentActivationEnabled");
+    rc |= reg_delete_value(HKEY_CURRENT_USER, VOICE_ACTIVATION_KEY,
+                           "AgentActivationOnLockScreenEnabled");
+    return rc;
+}
+static int active_voice_activation_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, VOICE_ACTIVATION_KEY, "AgentActivationEnabled", 0);
+}
+
+#define USER_PROFILE_KEY "Control Panel\\International\\User Profile"
+
+static int apply_language_list_off(void) {
+    return reg_set_dword(HKEY_CURRENT_USER, USER_PROFILE_KEY, "HttpAcceptLanguageOptOut", 1);
+}
+static int revert_language_list_off(void) {
+    return reg_delete_value(HKEY_CURRENT_USER, USER_PROFILE_KEY, "HttpAcceptLanguageOptOut");
+}
+static int active_language_list_off(void) {
+    return reg_dword_equals(HKEY_CURRENT_USER, USER_PROFILE_KEY, "HttpAcceptLanguageOptOut", 1);
+}
+
+static int apply_edge_telemetry_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "MetricsReportingEnabled", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "SendSiteInfoToImproveServices", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "PersonalizationReportingEnabled", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "UserFeedbackAllowed", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "DiagnosticData", 0);
+    return rc;
+}
+static int revert_edge_telemetry_off(void) {
+    int rc = 0;
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "MetricsReportingEnabled");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "SendSiteInfoToImproveServices");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "PersonalizationReportingEnabled");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "UserFeedbackAllowed");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "DiagnosticData");
+    return rc;
+}
+static int active_edge_telemetry_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, EDGE_POLICY_KEY, "MetricsReportingEnabled", 0);
+}
+
+#define WIFI_CONFIG_KEY   "SOFTWARE\\Microsoft\\WcmSvc\\wifinetworkmanager\\config"
+#define WIFI_FEATURES_KEY WIFI_CONFIG_KEY "\\features"
+
+static int apply_wifi_sense_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, WIFI_CONFIG_KEY, "AutoConnectAllowedOEM", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, WIFI_FEATURES_KEY, "WiFiSenseCredShared", 0);
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, WIFI_FEATURES_KEY, "WiFiSenseOpen", 0);
+    return rc;
+}
+static int revert_wifi_sense_off(void) {
+    int rc = 0;
+    rc |= reg_set_dword(HKEY_LOCAL_MACHINE, WIFI_CONFIG_KEY, "AutoConnectAllowedOEM", 1);
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, WIFI_FEATURES_KEY, "WiFiSenseCredShared");
+    rc |= reg_delete_value(HKEY_LOCAL_MACHINE, WIFI_FEATURES_KEY, "WiFiSenseOpen");
+    return rc;
+}
+static int active_wifi_sense_off(void) {
+    return reg_dword_equals(HKEY_LOCAL_MACHINE, WIFI_CONFIG_KEY, "AutoConnectAllowedOEM", 0);
+}
+
 /* =======================================================================
  * TABLE
  * ===================================================================== */
@@ -1024,7 +1383,7 @@ Tweak g_tweaks[] = {
       CAT_PERFORMANCE, 1, apply_game_priority, revert_game_priority, active_game_priority, 0 },
     { "hags", "Hardware-accelerated GPU scheduling",
       "Enables HAGS (GPU-managed VRAM scheduling). Requires a reboot to take effect",
-      CAT_PERFORMANCE, 1, apply_hags, revert_hags, active_hags, 0 },
+      CAT_PERFORMANCE, 1, apply_hags, revert_hags, active_hags, 0, 1 },
     { "network_throttle", "Disable network throttling index",
       "Removes the QoS packet scheduler's throttle on non-DSCP network traffic (lower latency)",
       CAT_PERFORMANCE, 1, apply_network_throttle, revert_network_throttle, active_network_throttle, 0 },
@@ -1037,7 +1396,7 @@ Tweak g_tweaks[] = {
     { "nic_interrupt_mod_off", "Disable NIC interrupt moderation",
       "Delivers network interrupts immediately instead of batching them (needs a reboot)",
       CAT_PERFORMANCE, 1, apply_nic_interrupt_moderation_off, revert_nic_interrupt_moderation_off,
-      active_nic_interrupt_moderation_off, 0 },
+      active_nic_interrupt_moderation_off, 0, 1 },
     { "visual_effects", "Best-performance visual effects",
       "Disables animations/transparency effects that cost GPU/CPU cycles",
       CAT_PERFORMANCE, 0, apply_visual_effects, revert_visual_effects, active_visual_effects, 0 },
@@ -1058,10 +1417,55 @@ Tweak g_tweaks[] = {
       CAT_PERFORMANCE, 1, apply_hibernate_off, revert_hibernate_off, active_hibernate_off, 0 },
     { "dynamic_tick_off", "Disable dynamic tick",
       "Keeps the kernel timer at a fixed rate for smoother frame pacing (needs a reboot)",
-      CAT_PERFORMANCE, 1, apply_dynamic_tick_off, revert_dynamic_tick_off, active_dynamic_tick_off, 0 },
+      CAT_PERFORMANCE, 1, apply_dynamic_tick_off, revert_dynamic_tick_off, active_dynamic_tick_off, 0, 1 },
     { "driver_search_off", "Disable automatic driver search on new hardware",
       "Stops Windows Update from fetching drivers when devices are plugged in",
       CAT_PERFORMANCE, 1, apply_driver_search_off, revert_driver_search_off, active_driver_search_off, 0 },
+    { "valorant_priority", "Launch Valorant at High CPU priority",
+      "Windows starts VALORANT-Win64-Shipping.exe at High CPU + I/O priority (set at launch, "
+      "so the anti-cheat never sees an outside process touch the game)",
+      CAT_PERFORMANCE, 1, apply_valorant_priority, revert_valorant_priority, active_valorant_priority, 0 },
+    { "core_parking_off", "Disable CPU core parking",
+      "Keeps every core unparked so the scheduler never has to wake one mid-frame",
+      CAT_PERFORMANCE, 1, apply_core_parking_off, revert_core_parking_off, active_core_parking_off, 0 },
+    { "power_throttling_off", "Disable CPU power throttling",
+      "Stops Windows from clocking down threads it decides are 'background' work",
+      CAT_PERFORMANCE, 1, apply_power_throttling_off, revert_power_throttling_off,
+      active_power_throttling_off, 0 },
+    { "fso_off", "Disable fullscreen optimizations",
+      "Forces real exclusive fullscreen instead of the borderless-window emulation (lower input lag)",
+      CAT_PERFORMANCE, 0, apply_fso_off, revert_fso_off, active_fso_off, 0 },
+    { "mouse_accel_off", "Disable mouse acceleration",
+      "Turns off 'enhance pointer precision' so cursor movement maps 1:1 to mouse movement",
+      CAT_PERFORMANCE, 0, apply_mouse_accel_off, revert_mouse_accel_off, active_mouse_accel_off, 0 },
+    { "accessibility_hotkeys_off", "Disable Sticky/Filter/Toggle Keys shortcuts",
+      "Stops the accessibility prompt stealing focus when you hold Shift or mash a key in-game",
+      CAT_PERFORMANCE, 0, apply_accessibility_hotkeys_off, revert_accessibility_hotkeys_off,
+      active_accessibility_hotkeys_off, 0 },
+    { "mpo_off", "Disable Multi-Plane Overlay (MPO)",
+      "Fixes DWM overlay flicker/stutter seen on many GPU drivers (needs a reboot)",
+      CAT_PERFORMANCE, 1, apply_mpo_off, revert_mpo_off, active_mpo_off, 0, 1 },
+    { "platform_clock_off", "Force the invariant TSC timer (disable HPET clock)",
+      "Pins the OS clock source to the TSC; undoes 'useplatformclock yes' from OEM images and old guides (needs a reboot)",
+      CAT_PERFORMANCE, 1, apply_platform_clock_off, revert_platform_clock_off,
+      active_platform_clock_off, 0, 1 },
+    { "toasts_off", "Disable toast notifications",
+      "Stops notification popups from interrupting or alt-tabbing you mid-match",
+      CAT_PERFORMANCE, 0, apply_toasts_off, revert_toasts_off, active_toasts_off, 0 },
+    { "widgets_off", "Disable Widgets / News and Interests",
+      "Stops the Widgets host process from running in the background",
+      CAT_PERFORMANCE, 1, apply_widgets_off, revert_widgets_off, active_widgets_off, 0 },
+    { "auto_maintenance_off", "Disable Automatic Maintenance",
+      "Stops Windows kicking off defrag/scans/updates on its own schedule while you're playing",
+      CAT_PERFORMANCE, 1, apply_auto_maintenance_off, revert_auto_maintenance_off,
+      active_auto_maintenance_off, 0 },
+    { "pca_off", "Disable Program Compatibility Assistant",
+      "Stops PcaSvc watching every process launch for compatibility problems",
+      CAT_PERFORMANCE, 1, apply_pca_off, revert_pca_off, active_pca_off, 0 },
+    { "edge_background_off", "Disable Edge startup boost & background mode",
+      "Stops Microsoft Edge keeping processes resident when no window is open",
+      CAT_PERFORMANCE, 1, apply_edge_background_off, revert_edge_background_off,
+      active_edge_background_off, 0 },
 
     /* --- Telemetry / tracking / privacy --- */
     { "disable_diagtrack", "Disable Connected User Experiences and Telemetry",
@@ -1146,11 +1550,33 @@ Tweak g_tweaks[] = {
     { "error_reporting", "Disable Windows Error Reporting",
       "Stops WerSvc and disables crash report uploads to Microsoft",
       CAT_TELEMETRY, 1, apply_error_reporting, revert_error_reporting, active_error_reporting, 0 },
+    { "cloud_search_off", "Disable cloud content search & search history",
+      "Stops Start search querying your OneDrive/Outlook account and keeping a local query history",
+      CAT_TELEMETRY, 0, apply_cloud_search_off, revert_cloud_search_off, active_cloud_search_off, 0 },
+    { "app_launch_tracking_off", "Disable app launch tracking",
+      "Stops Windows recording which apps you open to rank Start menu suggestions",
+      CAT_TELEMETRY, 0, apply_app_launch_tracking_off, revert_app_launch_tracking_off,
+      active_app_launch_tracking_off, 0 },
+    { "voice_activation_off", "Disable voice activation / wake words",
+      "Stops apps listening for a wake word in the background, including on the lock screen",
+      CAT_TELEMETRY, 0, apply_voice_activation_off, revert_voice_activation_off,
+      active_voice_activation_off, 0 },
+    { "language_list_off", "Stop websites reading your language list",
+      "Opts out of exposing your full installed-language list to sites for fingerprinting",
+      CAT_TELEMETRY, 0, apply_language_list_off, revert_language_list_off, active_language_list_off, 0 },
+    { "edge_telemetry_off", "Disable Microsoft Edge telemetry",
+      "Turns off Edge usage metrics, browsing-history reporting, feedback and diagnostic data",
+      CAT_TELEMETRY, 1, apply_edge_telemetry_off, revert_edge_telemetry_off, active_edge_telemetry_off, 0 },
+    { "wifi_sense_off", "Disable Wi-Fi Sense / auto-connect to open hotspots",
+      "Stops Windows joining suggested open hotspots and sharing network credentials",
+      CAT_TELEMETRY, 1, apply_wifi_sense_off, revert_wifi_sense_off, active_wifi_sense_off, 0 },
 };
 
 const int g_tweak_count = sizeof(g_tweaks) / sizeof(g_tweaks[0]);
 
 void tweaks_refresh_state(void) {
+    /* One bcdedit query serves every boot-config tweak in this pass. */
+    bcd_flags_invalidate();
     for (int i = 0; i < g_tweak_count; i++) {
         g_tweaks[i].enabled = g_tweaks[i].is_active() ? 1 : 0;
     }
